@@ -1,0 +1,32 @@
+# Example Prometheus alerting rules. Thresholds are starting points, not
+# recommendations: tune them against your own baseline.
+groups:
+  - name: eventstream
+    rules:
+      - alert: OfflinePartitions
+        expr: controller_offline_partitions > 0
+        for: 30s
+        annotations: { summary: "Partitions have no leader: writes and reads unavailable" }
+      - alert: UnderReplicatedPartitions
+        expr: controller_under_replicated_partitions > 0
+        for: 5m
+        annotations: { summary: "ISR smaller than replica set: reduced durability" }
+      - alert: BrokerLeaseLost
+        expr: broker_lease_valid == 0
+        for: 30s
+        annotations: { summary: "Broker cannot reach controller; its leaders refuse writes" }
+      - alert: ReplicaLagGrowing
+        expr: max by (topic, partition, follower) (partition_replica_last_caught_up_seconds) > 30
+        for: 2m
+      - alert: ProduceThrottling
+        expr: sum by (scope) (rate(broker_throttled_requests_total[5m])) > 10
+        for: 10m
+      - alert: BrokerShedding
+        expr: sum(rate(broker_rejected_requests_total[5m])) > 1
+        for: 5m
+        annotations: { summary: "Backpressure is rejecting work: capacity problem" }
+      - alert: SlowFsync
+        expr: histogram_quantile(0.99, sum by (le) (rate(broker_fsync_duration_seconds_bucket[5m]))) > 0.1
+        for: 10m
+      - alert: RebalanceStorm
+        expr: sum by (group) (increase(group_rebalances_total[10m])) > 10

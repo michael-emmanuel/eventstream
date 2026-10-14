@@ -1,0 +1,293 @@
+openapi: 3.0.3
+info:
+  title: Event Streaming Platform API
+  version: "1.0"
+  description: |
+    HTTP/JSON API of the broker, controller and gateway.
+
+    Data-plane requests are partition-scoped and must go to the partition
+    leader (see GET /v1/metadata). A broker that is not the leader answers
+    421 NOT_LEADER with a leader hint. The gateway offers a topic-scoped
+    produce endpoint for clients that cannot route by partition.
+
+    JSON values are UTF-8 strings. The storage and replication format is a
+    separate binary format (internal/record); the JSON API is a view of it.
+    A null `value` is a tombstone (delete marker on compacted topics).
+
+    Errors always have the shape `{"error": {"code", "message", "retriable", ...}}`.
+servers:
+  - url: http://localhost:9091
+    description: broker 1
+  - url: http://localhost:9000
+    description: controller
+  - url: http://localhost:8080
+    description: gateway
+security:
+  - bearer: []
+paths:
+  /v1/topics/{topic}/partitions/{partition}/events:
+    post:
+      summary: Produce a batch to one partition (broker, leader only)
+      parameters: [{ $ref: "#/components/parameters/topic" }, { $ref: "#/components/parameters/partition" }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/ProduceRequest" }
+      responses:
+        "200": { description: Appended (or recognized duplicate), content: { application/json: { schema: { $ref: "#/components/schemas/ProduceResponse" } } } }
+        "400": { $ref: "#/components/responses/Error" }
+        "409": { description: OUT_OF_ORDER_SEQUENCE, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "421": { description: NOT_LEADER or LEASE_EXPIRED (refresh metadata and retry), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "429": { description: THROTTLED (rate limit; honour Retry-After), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "503": { description: BROKER_OVERLOADED, NOT_ENOUGH_REPLICAS or STORAGE_ERROR, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "504": { description: REPLICATION_TIMEOUT (appended on leader; may or may not commit; retry with same sequence), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    get:
+      summary: Fetch committed records (broker leader, or gateway proxy)
+      parameters:
+        - $ref: "#/components/parameters/topic"
+        - $ref: "#/components/parameters/partition"
+        - { name: offset, in: query, schema: { type: integer, format: int64 }, description: "start offset (default: log start)" }
+        - { name: max_events, in: query, schema: { type: integer, default: 500, maximum: 10000 } }
+        - { name: max_bytes, in: query, schema: { type: integer, default: 1048576 } }
+        - { name: wait_ms, in: query, schema: { type: integer, default: 0, maximum: 30000 }, description: long-poll wait when no data is available }
+      responses:
+        "200": { description: Records below the high-water mark, content: { application/json: { schema: { $ref: "#/components/schemas/FetchResponse" } } } }
+        "416": { description: OFFSET_OUT_OF_RANGE (includes log_start_offset and high_watermark), content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+        "421": { $ref: "#/components/responses/Error" }
+  /v1/topics/{topic}/partitions/{partition}/offsets:
+    get:
+      summary: Log start, log end, high-water mark, offset for timestamp (broker leader)
+      parameters:
+        - $ref: "#/components/parameters/topic"
+        - $ref: "#/components/parameters/partition"
+        - { name: timestamp, in: query, schema: { type: integer, format: int64 }, description: unix ms }
+      responses:
+        "200": { description: Offsets, content: { application/json: { schema: { $ref: "#/components/schemas/OffsetsResponse" } } } }
+  /v1/topics/{topic}/events:
+    post:
+      summary: Topic-level produce with key-based routing (gateway only)
+      parameters: [{ $ref: "#/components/parameters/topic" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/Record"
+                - type: object
+                  properties:
+                    acks: { type: string, enum: [all, leader, quorum] }
+                    records: { type: array, items: { $ref: "#/components/schemas/Record" } }
+      responses:
+        "200": { description: All records acknowledged }
+        "207": { description: Some records failed (see per-record error) }
+  /v1/metadata:
+    get:
+      summary: Cluster metadata (broker cached copy, or controller with long poll)
+      parameters:
+        - { name: min_version, in: query, schema: { type: integer }, description: controller only }
+        - { name: wait_ms, in: query, schema: { type: integer }, description: controller only }
+      responses:
+        "200": { description: Metadata, content: { application/json: { schema: { $ref: "#/components/schemas/Cluster" } } } }
+  /v1/producer-ids:
+    post:
+      summary: Allocate a producer ID for idempotent production
+      responses:
+        "200": { description: ID, content: { application/json: { schema: { type: object, properties: { producer_id: { type: integer } } } } } }
+  /v1/topics:
+    get: { summary: List topics (controller), responses: { "200": { description: Topics } } }
+    post:
+      summary: Create topic (controller)
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, partitions]
+              properties:
+                name: { type: string }
+                partitions: { type: integer }
+                replication_factor: { type: integer }
+                config: { $ref: "#/components/schemas/TopicConfig" }
+      responses:
+        "201": { description: Created }
+        "409": { description: TOPIC_ALREADY_EXISTS }
+        "503": { description: INSUFFICIENT_BROKERS }
+  /v1/topics/{topic}:
+    get: { summary: Describe topic, parameters: [{ $ref: "#/components/parameters/topic" }], responses: { "200": { description: Topic } } }
+    delete: { summary: Delete topic, parameters: [{ $ref: "#/components/parameters/topic" }], responses: { "204": { description: Deleted } } }
+  /v1/topics/{topic}/config:
+    patch:
+      summary: Alter topic config (partial)
+      parameters: [{ $ref: "#/components/parameters/topic" }]
+      requestBody: { content: { application/json: { schema: { $ref: "#/components/schemas/TopicConfig" } } } }
+      responses: { "200": { description: Updated topic } }
+  /v1/topics/{topic}/partitions:
+    post:
+      summary: Increase partition count (remaps keys)
+      parameters: [{ $ref: "#/components/parameters/topic" }]
+      requestBody: { content: { application/json: { schema: { type: object, properties: { total_partitions: { type: integer } } } } } }
+      responses: { "200": { description: Updated topic } }
+  /v1/cluster:
+    get: { summary: Brokers, leader counts, under-replicated and offline partitions, responses: { "200": { description: Summary } } }
+  /v1/groups/{group}/join:
+    post:
+      summary: Join or rejoin a consumer group; blocks until the rebalance completes
+      parameters: [{ $ref: "#/components/parameters/group" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                member_id: { type: string }
+                client_id: { type: string }
+                topics: { type: array, items: { type: string } }
+                session_timeout_ms: { type: integer }
+                rebalance_timeout_ms: { type: integer }
+                assignor: { type: string, enum: [range, roundrobin, sticky] }
+      responses:
+        "200": { description: "member_id, generation, assignment" }
+        "409": { description: UNKNOWN_MEMBER_ID or REBALANCE_IN_PROGRESS }
+  /v1/groups/{group}/heartbeat:
+    post:
+      summary: Keep a member alive; 409 REBALANCE_IN_PROGRESS / ILLEGAL_GENERATION means rejoin
+      parameters: [{ $ref: "#/components/parameters/group" }]
+      responses: { "200": { description: OK } }
+  /v1/groups/{group}/leave:
+    post: { summary: Leave immediately (triggers rebalance), parameters: [{ $ref: "#/components/parameters/group" }], responses: { "204": { description: Left } } }
+  /v1/groups/{group}/offsets:
+    get: { summary: Committed offsets, parameters: [{ $ref: "#/components/parameters/group" }], responses: { "200": { description: Offsets } } }
+    post:
+      summary: Commit offsets (fenced by generation and ownership)
+      parameters: [{ $ref: "#/components/parameters/group" }]
+      responses:
+        "204": { description: Committed }
+        "409": { description: ILLEGAL_GENERATION, UNKNOWN_MEMBER_ID, PARTITION_NOT_OWNED, GROUP_NOT_EMPTY }
+  /v1/groups/{group}/lag:
+    get: { summary: "Per-partition lag = high_water_mark - committed_offset", parameters: [{ $ref: "#/components/parameters/group" }], responses: { "200": { description: Lag } } }
+  /v1/groups/{group}/offsets/reset:
+    post:
+      summary: Reset offsets of a stopped group (replay)
+      parameters: [{ $ref: "#/components/parameters/group" }]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                topic: { type: string }
+                to: { type: string, enum: [earliest, latest, offset, timestamp] }
+                offset: { type: integer }
+                timestamp: { type: string, description: RFC 3339 or unix ms }
+                dry_run: { type: boolean }
+      responses: { "200": { description: New offsets }, "409": { description: GROUP_NOT_EMPTY } }
+  /v1/admin/partitions:
+    get: { summary: "Broker: local replica state (role, LEO, HWM, ISR, follower lag)", responses: { "200": { description: State } } }
+  /v1/admin/faults:
+    post: { summary: "Broker: set fault injection (see internal/fault.Config)", responses: { "200": { description: Active faults } } }
+  /v1/admin/limits:
+    post: { summary: "Broker: set rate limits", responses: { "200": { description: Active limits } } }
+  /v1/admin/maintenance:
+    post: { summary: "Broker: run retention and compaction now", responses: { "200": { description: Per-partition report } } }
+  /metrics:
+    get: { summary: Prometheus metrics, security: [], responses: { "200": { description: text exposition format } } }
+components:
+  securitySchemes:
+    bearer: { type: http, scheme: bearer, description: "Only enforced when the server runs with -auth-config" }
+  parameters:
+    topic: { name: topic, in: path, required: true, schema: { type: string } }
+    partition: { name: partition, in: path, required: true, schema: { type: integer } }
+    group: { name: group, in: path, required: true, schema: { type: string } }
+  responses:
+    Error: { description: Error, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+  schemas:
+    Record:
+      type: object
+      properties:
+        key: { type: string, nullable: true }
+        value: { type: string, nullable: true, description: null = tombstone }
+        headers: { type: object, additionalProperties: { type: string } }
+        partition: { type: integer, description: gateway only, explicit partition }
+    ProduceRequest:
+      type: object
+      required: [records]
+      properties:
+        producer_id: { type: integer, description: "0 = not idempotent" }
+        base_sequence: { type: integer, description: per-partition sequence of the first record }
+        acks: { type: string, enum: [all, leader, quorum], default: all }
+        timeout_ms: { type: integer }
+        records: { type: array, items: { $ref: "#/components/schemas/Record" } }
+    ProduceResponse:
+      type: object
+      properties:
+        topic: { type: string }
+        partition: { type: integer }
+        base_offset: { type: integer }
+        last_offset: { type: integer }
+        duplicate: { type: boolean }
+        log_append_time: { type: integer }
+    ConsumerRecord:
+      type: object
+      properties:
+        topic: { type: string }
+        partition: { type: integer }
+        offset: { type: integer }
+        timestamp: { type: integer }
+        key: { type: string, nullable: true }
+        value: { type: string, nullable: true }
+        headers: { type: object, additionalProperties: { type: string } }
+        leader_epoch: { type: integer }
+        producer_id: { type: integer }
+        sequence: { type: integer }
+    FetchResponse:
+      type: object
+      properties:
+        records: { type: array, items: { $ref: "#/components/schemas/ConsumerRecord" } }
+        high_watermark: { type: integer }
+        log_start_offset: { type: integer }
+        log_end_offset: { type: integer }
+        next_offset: { type: integer }
+    OffsetsResponse:
+      type: object
+      properties:
+        log_start_offset: { type: integer }
+        log_end_offset: { type: integer }
+        high_watermark: { type: integer }
+        offset_for_timestamp: { type: integer }
+    TopicConfig:
+      type: object
+      properties:
+        retention_ms: { type: integer }
+        retention_bytes: { type: integer }
+        segment_bytes: { type: integer }
+        segment_ms: { type: integer }
+        cleanup_policy: { type: string, enum: [delete, compact, "compact,delete"] }
+        min_insync_replicas: { type: integer }
+        max_event_bytes: { type: integer }
+        compression: { type: string, enum: [none] }
+        unclean_leader_election: { type: boolean }
+        tombstone_retention_ms: { type: integer }
+        replica_lag_max_ms: { type: integer }
+        tenant: { type: string }
+    Cluster:
+      type: object
+      properties:
+        version: { type: integer }
+        controller_url: { type: string }
+        brokers: { type: array, items: { type: object } }
+        topics: { type: array, items: { type: object } }
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string }
+            message: { type: string }
+            retriable: { type: boolean }
+            leader_id: { type: integer }
+            leader_url: { type: string }
+            retry_after_ms: { type: integer }
+            log_start_offset: { type: integer }
+            high_watermark: { type: integer }

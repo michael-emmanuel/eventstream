@@ -1,0 +1,4 @@
+/bin/
+/data/
+coverage.out
+*.pprof

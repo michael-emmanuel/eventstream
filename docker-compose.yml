@@ -1,0 +1,103 @@
+# Local cluster: 1 controller, 3 brokers, 1 gateway, 3 consumers, 1 producer.
+#
+#   docker compose up -d --build
+#   docker compose run --rm tools streamctl cluster
+#   docker compose logs -f consumer-1
+#   docker compose kill broker-2            # crash a broker
+#   docker compose start broker-2           # bring it back (recovery + catch-up)
+#
+# Advertised URLs use service names (http://broker-1:9091), so CLI commands
+# run inside the network via the "tools" service. Ports are also published
+# on localhost for curl and the browser (metrics), but clients on the host
+# would be redirected to container hostnames: use the gateway (localhost:8080)
+# from the host instead.
+x-broker: &broker
+  build: { context: ., dockerfile: docker/Dockerfile }
+  image: eventstream:local
+  restart: "no"
+  depends_on: [controller]
+
+services:
+  controller:
+    build: { context: ., dockerfile: docker/Dockerfile }
+    image: eventstream:local
+    command: controller -addr :9000 -advertise http://controller:9000 -data /data -session-timeout 6s -lease 4s
+    ports: ["9000:9000"]
+    volumes: ["controller-data:/data"]
+
+  broker-1:
+    <<: *broker
+    command: broker -id 1 -addr :9091 -advertise http://broker-1:9091 -data /data -controller http://controller:9000 -maintenance-interval 10s
+    ports: ["9091:9091"]
+    volumes: ["broker-1-data:/data"]
+  broker-2:
+    <<: *broker
+    command: broker -id 2 -addr :9092 -advertise http://broker-2:9092 -data /data -controller http://controller:9000 -maintenance-interval 10s
+    ports: ["9092:9092"]
+    volumes: ["broker-2-data:/data"]
+  broker-3:
+    <<: *broker
+    command: broker -id 3 -addr :9093 -advertise http://broker-3:9093 -data /data -controller http://controller:9000 -maintenance-interval 10s
+    ports: ["9093:9093"]
+    volumes: ["broker-3-data:/data"]
+
+  gateway:
+    image: eventstream:local
+    command: gateway -addr :8080 -brokers http://broker-1:9091,http://broker-2:9092,http://broker-3:9093
+    ports: ["8080:8080"]
+    depends_on: [broker-1, broker-2, broker-3]
+
+  # Topic setup runs once and exits.
+  init:
+    image: eventstream:local
+    environment: { STREAM_BROKERS: "http://broker-1:9091,http://broker-2:9092,http://broker-3:9093" }
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        for i in $$(seq 1 30); do streamctl cluster >/dev/null 2>&1 && break; sleep 1; done
+        sleep 3
+        streamctl topics create orders -p 6 -rf 3 min_insync_replicas=2 || true
+        streamctl topics create profiles -p 3 -rf 3 cleanup_policy=compact segment_bytes=65536 || true
+    depends_on: [broker-1, broker-2, broker-3]
+
+  producer:
+    image: eventstream:local
+    environment: { STREAM_BROKERS: "http://broker-1:9091,http://broker-2:9092,http://broker-3:9093" }
+    command: producer -topic orders -rate 20 -quiet
+    depends_on: [init]
+    restart: on-failure
+
+  consumer-1: &consumer
+    image: eventstream:local
+    environment: { STREAM_BROKERS: "http://broker-1:9091,http://broker-2:9092,http://broker-3:9093" }
+    command: consumer -group fraud-detector -topic orders -name consumer-1 -quiet -session-timeout 6s
+    depends_on: [init]
+    restart: on-failure
+  consumer-2:
+    <<: *consumer
+    command: consumer -group fraud-detector -topic orders -name consumer-2 -quiet -session-timeout 6s
+  consumer-3:
+    <<: *consumer
+    command: consumer -group fraud-detector -topic orders -name consumer-3 -quiet -session-timeout 6s
+
+  # CLI container: docker compose run --rm tools streamctl <command>
+  tools:
+    image: eventstream:local
+    environment:
+      STREAM_BROKERS: "http://broker-1:9091,http://broker-2:9092,http://broker-3:9093"
+      STREAM_CONTROLLER: "http://controller:9000"
+    entrypoint: []
+    command: ["streamctl", "help"]
+    profiles: ["tools"]
+
+  loadgen:
+    image: eventstream:local
+    environment: { STREAM_BROKERS: "http://broker-1:9091,http://broker-2:9092,http://broker-3:9093" }
+    command: loadgen -topic loadtest -rate 10000 -duration 60s
+    profiles: ["loadgen"]
+
+volumes:
+  controller-data:
+  broker-1-data:
+  broker-2-data:
+  broker-3-data:

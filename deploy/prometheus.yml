@@ -1,0 +1,8 @@
+# Scrape config for the local cluster (scripts/cluster.sh ports).
+global:
+  scrape_interval: 5s
+scrape_configs:
+  - job_name: controller
+    static_configs: [{ targets: ["localhost:9000"] }]
+  - job_name: brokers
+    static_configs: [{ targets: ["localhost:9091", "localhost:9092", "localhost:9093"] }]

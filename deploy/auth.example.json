@@ -1,0 +1,16 @@
+{
+  "enabled": true,
+  "keys": {
+    "replace-me-inter-broker-token": { "name": "broker", "superuser": true },
+    "replace-me-ops-token":          { "name": "ops", "superuser": true },
+    "replace-me-orders-svc-token":   { "name": "orders-svc", "tenant": "acme" },
+    "replace-me-fraud-svc-token":    { "name": "fraud-svc", "tenant": "acme" },
+    "replace-me-other-tenant-token": { "name": "globex-analytics", "tenant": "globex" }
+  },
+  "acls": [
+    { "principal": "orders-svc", "resource": "orders",   "operations": ["produce", "describe"] },
+    { "principal": "fraud-svc",  "resource": "orders",   "operations": ["consume", "describe"] },
+    { "principal": "fraud-svc",  "resource": "alerts.*", "operations": ["produce", "consume"] },
+    { "principal": "globex-analytics", "resource": "*",  "operations": ["consume"] }
+  ]
+}

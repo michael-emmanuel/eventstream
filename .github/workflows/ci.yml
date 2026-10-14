@@ -1,0 +1,26 @@
+name: ci
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+      - name: vet
+        run: go vet ./...
+      - name: test
+        run: go test -count=1 ./...
+      - name: race
+        run: go test -race -count=1 ./...
+      - name: benchmarks (smoke)
+        run: go test -run '^$' -bench . -benchtime 100x ./internal/record ./internal/log
+      - name: fuzz (smoke)
+        run: go test -run '^$' -fuzz FuzzDecode -fuzztime 15s ./internal/record
+      - name: build
+        run: go build ./cmd/...
